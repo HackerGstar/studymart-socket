@@ -79,22 +79,21 @@ function generateRoomCode() {
 async function initDatabase() {
     try {
         dbPool = await mysql.createPool({
-            host: 'localhost',
-            user: 'root',
-            password: '',
-            database: 'studymart',
+            host: process.env.DB_HOST || 'localhost',
+            user: process.env.DB_USER || 'root',
+            password: process.env.DB_PASSWORD || '',
+            database: process.env.DB_NAME || 'studymart',
             waitForConnections: true,
             connectionLimit: 10,
             queueLimit: 0
         });
         console.log('✅ MySQL connection pool created');
-        
         const [rows] = await dbPool.query('SELECT 1 as test');
         console.log('✅ Database connected');
-        
         return true;
     } catch (error) {
         console.error('❌ Database connection failed:', error.message);
+        console.log('⚠️ Server will run WITHOUT database. Real-time features like online status and messaging will still work via WebSocket.');
         return false;
     }
 }
