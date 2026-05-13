@@ -75,25 +75,61 @@ function generateRoomCode() {
     return Math.random().toString(36).substring(2, 8).toUpperCase();
 }
 
-// Initialize database connection
+// ============================================================
+// FIXED: Database initialization for Railway
+// Uses environment variables that you MUST set in Railway
+// ============================================================
 async function initDatabase() {
+    // Get database configuration from environment variables
+    const dbHost = process.env.DB_HOST;
+    const dbUser = process.env.DB_USER;
+    const dbPassword = process.env.DB_PASSWORD;
+    const dbName = process.env.DB_NAME;
+    const dbPort = parseInt(process.env.DB_PORT) || 3306;
+    
+    // Check if all required variables are set
+    if (!dbHost || !dbUser || !dbName) {
+        console.error('❌ Missing database environment variables!');
+        console.error('Please set the following in Railway:');
+        console.error('  DB_HOST - Your MySQL host (e.g., mysql.railway.internal or containers-us-west.railway.app)');
+        console.error('  DB_USER - Your database username');
+        console.error('  DB_PASSWORD - Your database password');
+        console.error('  DB_NAME - Your database name');
+        console.error('  DB_PORT - MySQL port (default 3306)');
+        console.log('⚠️ Server will run WITHOUT database. Real-time features will have limited functionality.');
+        return false;
+    }
+    
     try {
+        console.log(`📡 Attempting to connect to database at ${dbHost}:${dbPort}`);
+        
         dbPool = await mysql.createPool({
-            host: process.env.DB_HOST || 'localhost',
-            user: process.env.DB_USER || 'root',
-            password: process.env.DB_PASSWORD || '',
-            database: process.env.DB_NAME || 'studymart',
+            host: dbHost,
+            port: dbPort,
+            user: dbUser,
+            password: dbPassword || '',
+            database: dbName,
             waitForConnections: true,
             connectionLimit: 10,
-            queueLimit: 0
+            queueLimit: 0,
+            enableKeepAlive: true,
+            keepAliveInitialDelay: 0,
+            connectTimeout: 10000
         });
+        
         console.log('✅ MySQL connection pool created');
-        const [rows] = await dbPool.query('SELECT 1 as test');
-        console.log('✅ Database connected');
+        
+        // Test the connection
+        const [rows] = await dbPool.query('SELECT 1 as test, NOW() as time, DATABASE() as db_name');
+        console.log(`✅ Database connected successfully to: ${rows[0].db_name}`);
+        console.log(`✅ Server time: ${rows[0].time}`);
         return true;
+        
     } catch (error) {
         console.error('❌ Database connection failed:', error.message);
-        console.log('⚠️ Server will run WITHOUT database. Real-time features like online status and messaging will still work via WebSocket.');
+        console.error('Error code:', error.code);
+        console.log('⚠️ Server will run WITHOUT database. Real-time features like message storage will not work.');
+        console.log('⚠️ Please check your Railway MySQL service is running and environment variables are correct.');
         return false;
     }
 }
@@ -427,31 +463,43 @@ io.on('connection', async (socket) => {
             return;
         }
         
-        // CHECK IF BLOCKED
-        try {
-            const [blockedRows] = await dbPool.query(
-                `SELECT id FROM blocked_users 
-                 WHERE (user_id = ? AND blocked_user_id = ?) 
-                    OR (user_id = ? AND blocked_user_id = ?)
-                 LIMIT 1`,
-                [currentUserId, to_user_id, to_user_id, currentUserId]
-            );
-            
-            if (blockedRows.length > 0) {
-                socket.emit('message_error', {
-                    success: false,
-                    error: 'Cannot send message. User may be blocked.',
-                    temp_id: temp_id
-                });
-                console.log(`🚫 Blocked message attempt: ${currentUserId} -> ${to_user_id}`);
-                return;
+        // CHECK IF BLOCKED (only if dbPool exists)
+        if (dbPool) {
+            try {
+                const [blockedRows] = await dbPool.query(
+                    `SELECT id FROM blocked_users 
+                     WHERE (user_id = ? AND blocked_user_id = ?) 
+                        OR (user_id = ? AND blocked_user_id = ?)
+                     LIMIT 1`,
+                    [currentUserId, to_user_id, to_user_id, currentUserId]
+                );
+                
+                if (blockedRows.length > 0) {
+                    socket.emit('message_error', {
+                        success: false,
+                        error: 'Cannot send message. User may be blocked.',
+                        temp_id: temp_id
+                    });
+                    console.log(`🚫 Blocked message attempt: ${currentUserId} -> ${to_user_id}`);
+                    return;
+                }
+            } catch (blockErr) {
+                console.error('Error checking block status:', blockErr.message);
             }
-        } catch (blockErr) {
-            console.error('Error checking block status:', blockErr.message);
         }
         // END BLOCK CHECK
         
         const recipientOnline = connectedUsers.has(to_user_id);
+        
+        // Check if database is available
+        if (!dbPool) {
+            socket.emit('message_error', {
+                success: false,
+                error: 'Database unavailable. Message not saved.',
+                temp_id: temp_id
+            });
+            return;
+        }
         
         try {
             // FIXED: Always insert as unread (0) - only mark read when user opens chat
@@ -601,6 +649,15 @@ io.on('connection', async (socket) => {
             return;
         }
         
+        if (!dbPool) {
+            socket.emit('message_error', {
+                success: false,
+                error: 'Database unavailable',
+                temp_id: temp_id
+            });
+            return;
+        }
+        
         try {
             const [result] = await dbPool.query(
                 `INSERT INTO group_messages (group_id, user_id, message, reply_to_id, created_at) 
@@ -682,7 +739,7 @@ io.on('connection', async (socket) => {
             console.error('Error sending group message:', error.message);
             socket.emit('message_error', {
                 success: false,
-                error: 'Failed to send group message',
+                error: 'Failed to send group message: ' + error.message,
                 temp_id: temp_id
             });
         }
@@ -720,6 +777,8 @@ io.on('connection', async (socket) => {
     socket.on('mark_read', async (data) => {
         const { from_user_id, group_id } = data;
         if (!currentUserId) return;
+        
+        if (!dbPool) return;
         
         if (from_user_id) {
             await markMessagesAsRead(currentUserId, from_user_id);
@@ -954,7 +1013,9 @@ io.on('connection', async (socket) => {
 async function startServer() {
     const dbConnected = await initDatabase();
     if (!dbConnected) {
-        console.error('❌ Failed to connect to database. Server will run but features may be limited.');
+        console.error('❌ Failed to connect to database. Server will run but message storage will not work.');
+        console.log('⚠️ Please set the following environment variables in Railway:');
+        console.log('   DB_HOST, DB_USER, DB_PASSWORD, DB_NAME');
     }
     
     server.listen(PORT, () => {
