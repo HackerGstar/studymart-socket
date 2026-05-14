@@ -81,11 +81,11 @@ function generateRoomCode() {
 // ============================================================
 async function initDatabase() {
     // Get database configuration from environment variables
-    const dbHost = process.env.DB_HOST;
-    const dbUser = process.env.DB_USER;
-    const dbPassword = process.env.DB_PASSWORD;
-    const dbName = process.env.DB_NAME;
-    const dbPort = parseInt(process.env.DB_PORT) || 3306;
+   const dbHost = process.env.MYSQLHOST;
+   const dbUser = process.env.MYSQLUSER;
+   const dbPassword = process.env.MYSQLPASSWORD;
+   const dbName = process.env.MYSQLDATABASE;
+   const dbPort = parseInt(process.env.MYSQLPORT) || 3306;;
     
     // Check if all required variables are set
     if (!dbHost || !dbUser || !dbName) {
