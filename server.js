@@ -988,6 +988,26 @@ io.on('connection', async (socket) => {
         }
     });
     
+    // ============================================================
+    // GET ACTIVE ROOMS - MOVED INSIDE CONNECTION BLOCK
+    // ============================================================
+    socket.on('get_active_rooms', (data) => {
+        const userRooms = [];
+        for (const [roomId, room] of activeQuizRooms) {
+            const isParticipant = room.participants.some(p => p.user_id == currentUserId);
+            if (isParticipant && room.status !== 'ended') {
+                userRooms.push({
+                    room_code: room.room_code,
+                    topic: room.topic,
+                    participants: room.participants.length,
+                    status: room.status,
+                    time_limit: room.time_limit
+                });
+            }
+        }
+        socket.emit('active_rooms_list', { rooms: userRooms });
+    });
+    
     // Handle disconnection
     socket.on('disconnect', async () => {
         console.log(`🔌 Disconnected: ${socket.id}`);
@@ -1008,25 +1028,6 @@ io.on('connection', async (socket) => {
         console.log(`Total connections remaining: ${connectedUsers.size}`);
     });
 });
-
-// check for active rooms
-socket.on('get_active_rooms', (data) => {
-    const userRooms = [];
-    for (const [roomId, room] of activeQuizRooms) {
-        const isParticipant = room.participants.some(p => p.user_id == currentUserId);
-        if (isParticipant && room.status !== 'ended') {
-            userRooms.push({
-                room_code: room.room_code,
-                topic: room.topic,
-                participants: room.participants.length,
-                status: room.status,
-                time_limit: room.time_limit
-            });
-        }
-    }
-    socket.emit('active_rooms_list', { rooms: userRooms });
- });
-
 
 // Start the server
 async function startServer() {
