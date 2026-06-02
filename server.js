@@ -6,10 +6,11 @@ const http = require('http');
 const socketIo = require('socket.io');
 const mysql = require('mysql2/promise');
 const crypto = require('crypto');
+const { URL } = require('url');
 
 // Configuration
 const PORT = process.env.PORT || 3000;
-const SECRET_KEY = 'studymart-socket-secret-key-2024';
+const SECRET_KEY = 'studymart-secret-key'; // Must match X-API-Key in SocketNotifier.php
 
 // Database connection pool
 let dbPool = null;
@@ -26,36 +27,274 @@ const roomTimers = new Map();
 
 // Create HTTP server
 const server = http.createServer((req, res) => {
-    // Health check endpoint
-    if (req.url === '/health') {
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ status: 'ok', timestamp: new Date().toISOString(), connections: connectedUsers.size }));
+    // Set CORS headers for all responses
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, X-API-Key, Authorization');
+    
+    // Handle OPTIONS preflight
+    if (req.method === 'OPTIONS') {
+        res.writeHead(200);
+        res.end();
         return;
     }
     
-    // Simple status page
-    if (req.url === '/status') {
+    // Parse URL
+    const url = new URL(req.url, `http://${req.headers.host}`);
+    const pathname = url.pathname;
+    
+    // ============================================================
+    // GET ENDPOINTS
+    // ============================================================
+    
+    // Health check endpoint
+    if (pathname === '/health') {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ 
+            status: 'ok', 
+            timestamp: new Date().toISOString(), 
+            connections: connectedUsers.size,
+            activeQuizRooms: activeQuizRooms.size,
+            dbConnected: dbPool !== null
+        }));
+        return;
+    }
+    
+    // Status page
+    if (pathname === '/status') {
         res.writeHead(200, { 'Content-Type': 'text/html' });
         res.end(`
             <!DOCTYPE html>
             <html>
-            <head><title>StudyMart Socket Server</title></head>
+            <head><title>StudyMart Socket Server</title>
+            <style>
+                body { font-family: Arial, sans-serif; padding: 20px; background: #f5f5f5; }
+                .card { background: white; padding: 20px; border-radius: 10px; margin: 10px 0; box-shadow: 0 2px 5px rgba(0,0,0,0.1); }
+                h1 { color: #9B87F5; }
+                .status-ok { color: green; }
+                .status-error { color: red; }
+            </style>
+            </head>
             <body>
-                <h1>StudyMart Socket.IO Server</h1>
-                <p>Status: Running</p>
-                <p>Connected Users: ${connectedUsers.size}</p>
-                <p>Active Quiz Rooms: ${activeQuizRooms.size}</p>
-                <p>Port: ${PORT}</p>
-                <p>Uptime: ${Math.floor(process.uptime())} seconds</p>
+                <h1>🚀 StudyMart Socket.IO Server</h1>
+                <div class="card">
+                    <h3>Server Status: <span class="status-ok">Running</span></h3>
+                    <p><strong>Connected Users:</strong> ${connectedUsers.size}</p>
+                    <p><strong>Active Quiz Rooms:</strong> ${activeQuizRooms.size}</p>
+                    <p><strong>Database:</strong> <span class="${dbPool ? 'status-ok' : 'status-error'}">${dbPool ? 'Connected' : 'Disconnected'}</span></p>
+                    <p><strong>Port:</strong> ${PORT}</p>
+                    <p><strong>Uptime:</strong> ${Math.floor(process.uptime())} seconds</p>
+                </div>
             </body>
             </html>
         `);
         return;
     }
     
-    res.writeHead(404);
-    res.end();
+    // ============================================================
+    // POST ENDPOINTS (REST API - Called by PHP SocketNotifier)
+    // ============================================================
+    
+    if (req.method === 'POST') {
+        let body = '';
+        
+        req.on('data', chunk => {
+            body += chunk.toString();
+        });
+        
+        req.on('end', () => {
+            // Verify API key
+            const apiKey = req.headers['x-api-key'];
+            if (apiKey !== SECRET_KEY) {
+                console.log('❌ Unauthorized API request - Invalid API key:', apiKey);
+                res.writeHead(401, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ error: 'Unauthorized' }));
+                return;
+            }
+            
+            let data;
+            try {
+                data = JSON.parse(body);
+            } catch (e) {
+                console.log('❌ Invalid JSON in request body');
+                res.writeHead(400, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ error: 'Invalid JSON' }));
+                return;
+            }
+            
+            console.log(`📡 REST API: ${req.method} ${pathname}`);
+            
+            // Route: /api/new-message
+            if (pathname === '/api/new-message') {
+                handleNewMessage(data, res);
+            }
+            // Route: /api/message-read
+            else if (pathname === '/api/message-read') {
+                handleMessageRead(data, res);
+            }
+            // Route: /api/typing
+            else if (pathname === '/api/typing') {
+                handleTyping(data, res);
+            }
+            // Route: /api/user-status
+            else if (pathname === '/api/user-status') {
+                handleUserStatus(data, res);
+            }
+            // Route: /api/new-notification
+            else if (pathname === '/api/new-notification') {
+                handleNewNotification(data, res);
+            }
+            // Route: /api/post-score-update
+            else if (pathname === '/api/post-score-update') {
+                handlePostScoreUpdate(data, res);
+            }
+            else {
+                console.log(`❌ Unknown endpoint: ${pathname}`);
+                res.writeHead(404, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ error: 'Endpoint not found' }));
+            }
+        });
+        
+        return;
+    }
+    
+    // 404 for other requests
+    res.writeHead(404, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: 'Not found' }));
 });
+
+// ============================================================
+// REST API HANDLERS
+// ============================================================
+
+async function handleNewMessage(data, res) {
+    console.log('📨 REST API: New message - From:', data.from_user_id, 'To:', data.to_user_id);
+    
+    const { to_user_id, from_user_id } = data;
+    
+    if (!to_user_id || !from_user_id) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Missing user IDs' }));
+        return;
+    }
+    
+    // Send to receiver in real-time
+    const receiverOnline = connectedUsers.has(to_user_id);
+    if (receiverOnline) {
+        const receiverSockets = connectedUsers.get(to_user_id);
+        for (const socketId of receiverSockets.socketIds) {
+            io.to(socketId).emit('new_private_message', {
+                ...data,
+                is_mine: false
+            });
+        }
+        console.log(`✅ Sent new_private_message to online user:${to_user_id}`);
+    } else {
+        console.log(`⚠️ Receiver ${to_user_id} is offline - message saved in DB`);
+    }
+    
+    // Send confirmation to sender if online
+    if (connectedUsers.has(from_user_id)) {
+        const senderSockets = connectedUsers.get(from_user_id);
+        for (const socketId of senderSockets.socketIds) {
+            io.to(socketId).emit('message_sent', {
+                message: data,
+                temp_id: data.temp_id
+            });
+        }
+        console.log(`✅ Sent message_sent confirmation to user:${from_user_id}`);
+    }
+    
+    // Update unread count for receiver
+    if (receiverOnline) {
+        const receiverSockets = connectedUsers.get(to_user_id);
+        for (const socketId of receiverSockets.socketIds) {
+            io.to(socketId).emit('unread_count_update');
+        }
+        console.log(`✅ Sent unread_count_update to user:${to_user_id}`);
+    }
+    
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ success: true, message: 'Message delivered' }));
+}
+
+async function handleMessageRead(data, res) {
+    console.log('📖 REST API: Message read:', data);
+    
+    const { user_id, from_user_id, message_id } = data;
+    
+    if (from_user_id && connectedUsers.has(from_user_id)) {
+        const senderSockets = connectedUsers.get(from_user_id);
+        for (const socketId of senderSockets.socketIds) {
+            io.to(socketId).emit('messages_read', {
+                from_user_id: user_id,
+                message_id: message_id
+            });
+        }
+    }
+    
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ success: true }));
+}
+
+async function handleTyping(data, res) {
+    const { from_user_id, to_user_id, is_typing } = data;
+    
+    if (to_user_id && connectedUsers.has(to_user_id)) {
+        const recipientSockets = connectedUsers.get(to_user_id);
+        for (const socketId of recipientSockets.socketIds) {
+            io.to(socketId).emit('user_typing', {
+                from_user_id: from_user_id,
+                is_typing: is_typing
+            });
+        }
+    }
+    
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ success: true }));
+}
+
+async function handleUserStatus(data, res) {
+    const { user_id, is_online } = data;
+    
+    io.emit('user_status_change', {
+        user_id: user_id,
+        is_online: is_online
+    });
+    
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ success: true }));
+}
+
+async function handleNewNotification(data, res) {
+    const { user_id, notification } = data;
+    
+    if (user_id && connectedUsers.has(user_id)) {
+        const userSockets = connectedUsers.get(user_id);
+        for (const socketId of userSockets.socketIds) {
+            io.to(socketId).emit('new_notification', notification);
+        }
+    }
+    
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ success: true }));
+}
+
+async function handlePostScoreUpdate(data, res) {
+    const { post_id, score, like_count, comment_count } = data;
+    
+    if (post_id) {
+        io.emit('post_score_update', {
+            post_id: post_id,
+            score: score,
+            like_count: like_count,
+            comment_count: comment_count
+        });
+    }
+    
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ success: true }));
+}
 
 // Initialize Socket.IO with CORS settings
 const io = socketIo(server, {
@@ -76,26 +315,23 @@ function generateRoomCode() {
 }
 
 // ============================================================
-// FIXED: Database initialization for Railway
-// Uses environment variables that you MUST set in Railway
+// Database initialization
 // ============================================================
 async function initDatabase() {
-    // Get database configuration from environment variables
-   const dbHost = process.env.MYSQLHOST;
-   const dbUser = process.env.MYSQLUSER;
-   const dbPassword = process.env.MYSQLPASSWORD;
-   const dbName = process.env.MYSQLDATABASE;
-   const dbPort = parseInt(process.env.MYSQLPORT) || 3306;;
+    const dbHost = process.env.MYSQLHOST;
+    const dbUser = process.env.MYSQLUSER;
+    const dbPassword = process.env.MYSQLPASSWORD;
+    const dbName = process.env.MYSQLDATABASE;
+    const dbPort = parseInt(process.env.MYSQLPORT) || 3306;
     
-    // Check if all required variables are set
     if (!dbHost || !dbUser || !dbName) {
         console.error('❌ Missing database environment variables!');
         console.error('Please set the following in Railway:');
-        console.error('  DB_HOST - Your MySQL host (e.g., mysql.railway.internal or containers-us-west.railway.app)');
-        console.error('  DB_USER - Your database username');
-        console.error('  DB_PASSWORD - Your database password');
-        console.error('  DB_NAME - Your database name');
-        console.error('  DB_PORT - MySQL port (default 3306)');
+        console.error('  MYSQLHOST - Your MySQL host');
+        console.error('  MYSQLUSER - Your database username');
+        console.error('  MYSQLPASSWORD - Your database password');
+        console.error('  MYSQLDATABASE - Your database name');
+        console.error('  MYSQLPORT - MySQL port (default 3306)');
         console.log('⚠️ Server will run WITHOUT database. Real-time features will have limited functionality.');
         return false;
     }
@@ -289,7 +525,9 @@ async function endQuizExam(roomId) {
     }, 60000);
 }
 
-// Socket.IO event handlers
+// ============================================================
+// Socket.IO Event Handlers
+// ============================================================
 io.on('connection', async (socket) => {
     console.log(`🔌 New connection: ${socket.id}`);
     
@@ -448,7 +686,7 @@ io.on('connection', async (socket) => {
     });
     
     // ============================================================
-    // SEND PRIVATE MESSAGE - WITH BLOCK CHECK AND READ RECEIPT FIX
+    // SEND PRIVATE MESSAGE - WITH BLOCK CHECK AND READ RECEIPT
     // ============================================================
     socket.on('send_private_message', async (data) => {
         const { to_user_id, message, reply_to_id, temp_id } = data;
@@ -487,7 +725,6 @@ io.on('connection', async (socket) => {
                 console.error('Error checking block status:', blockErr.message);
             }
         }
-        // END BLOCK CHECK
         
         const recipientOnline = connectedUsers.has(to_user_id);
         
@@ -502,7 +739,7 @@ io.on('connection', async (socket) => {
         }
         
         try {
-            // FIXED: Always insert as unread (0) - only mark read when user opens chat
+            // Always insert as unread (0) - only mark read when user opens chat
             const [result] = await dbPool.query(
                 `INSERT INTO messages (from_user_id, to_user_id, message, reply_to_id, is_read, created_at) 
                  VALUES (?, ?, ?, ?, 0, NOW())`,
@@ -537,10 +774,10 @@ io.on('connection', async (socket) => {
                 throw new Error('Failed to retrieve inserted message');
             }
             
-            const messageData = msgRows[0];
+            const messageDataResult = msgRows[0];
             
             const newMessage = {
-                ...messageData,
+                ...messageDataResult,
                 full_name: userData.full_name,
                 avatar: userData.avatar,
                 username: userData.username,
@@ -621,9 +858,10 @@ io.on('connection', async (socket) => {
                         });
                     }
                 }
+                console.log(`💬 Private message sent via socket: ${currentUserId} -> ${to_user_id}, Message ID: ${messageId}`);
+            } else {
+                console.log(`💬 Private message saved (recipient offline): ${currentUserId} -> ${to_user_id}, Message ID: ${messageId}`);
             }
-            
-            console.log(`💬 Private message sent: ${currentUserId} -> ${to_user_id}, Message ID: ${messageId}`);
             
         } catch (error) {
             console.error('Error sending private message:', error.message);
@@ -988,9 +1226,7 @@ io.on('connection', async (socket) => {
         }
     });
     
-    // ============================================================
-    // GET ACTIVE ROOMS - MOVED INSIDE CONNECTION BLOCK
-    // ============================================================
+    // Get active rooms
     socket.on('get_active_rooms', (data) => {
         const userRooms = [];
         for (const [roomId, room] of activeQuizRooms) {
@@ -1035,14 +1271,15 @@ async function startServer() {
     if (!dbConnected) {
         console.error('❌ Failed to connect to database. Server will run but message storage will not work.');
         console.log('⚠️ Please set the following environment variables in Railway:');
-        console.log('   DB_HOST, DB_USER, DB_PASSWORD, DB_NAME');
+        console.log('   MYSQLHOST, MYSQLUSER, MYSQLPASSWORD, MYSQLDATABASE, MYSQLPORT');
     }
     
     server.listen(PORT, () => {
         console.log(`🚀 Socket.IO server running on port ${PORT}`);
         console.log(`📍 Health check: http://localhost:${PORT}/health`);
         console.log(`📍 Status page: http://localhost:${PORT}/status`);
-        console.log(`📡 WebSocket endpoint: ws://localhost:${PORT}`);
+        console.log(`📡 REST API: http://localhost:${PORT}/api/*`);
+        console.log(`🔌 WebSocket: ws://localhost:${PORT}`);
     });
 }
 
