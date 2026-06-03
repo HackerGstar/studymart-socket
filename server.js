@@ -874,114 +874,95 @@ io.on('connection', async (socket) => {
     });
     
     // Handle sending a group message
-    socket.on('send_group_message', async (data) => {
-        const { group_id, message, reply_to_id, temp_id } = data;
+    // In your server.js, find the send_group_message handler and fix it:
+socket.on('send_group_message', async (data) => {
+    const { group_id, message, reply_to_id, temp_id } = data;
+    
+    if (!currentUserId) {
+        socket.emit('error', { message: 'Not authenticated' });
+        return;
+    }
+    
+    if (!message || !message.trim()) {
+        socket.emit('error', { message: 'Message cannot be empty' });
+        return;
+    }
+    
+    if (!dbPool) {
+        socket.emit('message_error', {
+            success: false,
+            error: 'Database unavailable',
+            temp_id: temp_id
+        });
+        return;
+    }
+    
+    try {
+        // FIXED: Only insert columns that exist - NO reply_to_id
+        const [result] = await dbPool.query(
+            `INSERT INTO group_messages (group_id, user_id, message, created_at) 
+             VALUES (?, ?, ?, NOW())`,
+            [group_id, currentUserId, message]
+        );
         
-        if (!currentUserId) {
-            socket.emit('error', { message: 'Not authenticated' });
-            return;
+        const messageId = result.insertId;
+        
+        // Fetch the message with user data - only select existing columns
+        const [rows] = await dbPool.query(`
+            SELECT gm.id, gm.group_id, gm.user_id, gm.message, 
+                   gm.image_url, gm.voice_url, gm.voice_duration,
+                   gm.created_at,
+                   u.full_name, u.avatar, u.username, u.is_verified
+            FROM group_messages gm
+            JOIN users u ON gm.user_id = u.id
+            WHERE gm.id = ?
+        `, [messageId]);
+        
+        if (!rows || rows.length === 0) {
+            throw new Error('Failed to retrieve inserted message');
         }
         
-        if (!message || !message.trim()) {
-            socket.emit('error', { message: 'Message cannot be empty' });
-            return;
+        const newMessage = rows[0];
+        newMessage.is_mine = true;
+        
+        // Fix URLs
+        if (newMessage.image_url && !newMessage.image_url.startsWith('http') && !newMessage.image_url.startsWith('/')) {
+            newMessage.image_url = '/' + newMessage.image_url;
+        }
+        if (newMessage.voice_url && !newMessage.voice_url.startsWith('http') && !newMessage.voice_url.startsWith('/')) {
+            newMessage.voice_url = '/' + newMessage.voice_url;
         }
         
-        if (!dbPool) {
-            socket.emit('message_error', {
-                success: false,
-                error: 'Database unavailable',
-                temp_id: temp_id
-            });
-            return;
-        }
+        const messageToSend = {
+            ...newMessage,
+            temp_id: temp_id
+        };
         
-        try {
-            const [result] = await dbPool.query(
-                `INSERT INTO group_messages (group_id, user_id, message, reply_to_id, created_at) 
-                 VALUES (?, ?, ?, ?, NOW())`,
-                [group_id, currentUserId, message, reply_to_id || null]
-            );
-            
-            const messageId = result.insertId;
-            
-            const [rows] = await dbPool.query(`
-                SELECT gm.*, u.full_name, u.avatar, u.username, u.is_verified
-                FROM group_messages gm
-                JOIN users u ON gm.user_id = u.id
-                WHERE gm.id = ?
-            `, [messageId]);
-            
-            const newMessage = rows[0];
-            
-            if (newMessage.image_url && !newMessage.image_url.startsWith('http') && !newMessage.image_url.startsWith('/studymart')) {
-                newMessage.image_url = '/studymart/' + newMessage.image_url;
-            }
-            if (newMessage.voice_url && !newMessage.voice_url.startsWith('http') && !newMessage.voice_url.startsWith('/studymart')) {
-                newMessage.voice_url = '/studymart/' + newMessage.voice_url;
-            }
-            
-            newMessage.is_mine = true;
-            
-            let replyToMessage = null;
-            if (reply_to_id) {
-                const [replyRows] = await dbPool.query(`
-                    SELECT gm.*, u.full_name, u.avatar, u.username
-                    FROM group_messages gm
-                    LEFT JOIN users u ON gm.user_id = u.id
-                    WHERE gm.id = ?
-                `, [reply_to_id]);
-                
-                if (replyRows.length > 0) {
-                    const quotedMsg = replyRows[0];
-                    if (quotedMsg.image_url && !quotedMsg.image_url.startsWith('http') && !quotedMsg.image_url.startsWith('/studymart')) {
-                        quotedMsg.image_url = '/studymart/' + quotedMsg.image_url;
-                    }
-                    if (quotedMsg.voice_url && !quotedMsg.voice_url.startsWith('http') && !quotedMsg.voice_url.startsWith('/studymart')) {
-                        quotedMsg.voice_url = '/studymart/' + quotedMsg.voice_url;
-                    }
-                    replyToMessage = {
-                        id: quotedMsg.id,
-                        message: quotedMsg.message,
-                        image_url: quotedMsg.image_url,
-                        voice_url: quotedMsg.voice_url,
-                        voice_duration: quotedMsg.voice_duration,
-                        is_mine: (quotedMsg.user_id == currentUserId),
-                        full_name: quotedMsg.full_name || 'User',
-                        created_at: quotedMsg.created_at
-                    };
-                }
-            }
-            
-            const messageToSend = {
-                ...newMessage,
-                reply_to_message: replyToMessage,
-                temp_id: temp_id
-            };
-            
-            socket.emit('group_message_sent', {
-                success: true,
-                message: messageToSend,
-                temp_id: temp_id
-            });
-            
-            const groupRoom = getGroupRoom(group_id);
-            io.to(groupRoom).emit('new_group_message', {
-                ...messageToSend,
-                is_mine: false
-            });
-            
-            console.log(`👥 Group message sent: ${currentUserId} -> group ${group_id}`);
-            
-        } catch (error) {
-            console.error('Error sending group message:', error.message);
-            socket.emit('message_error', {
-                success: false,
-                error: 'Failed to send group message: ' + error.message,
-                temp_id: temp_id
-            });
-        }
-    });
+        // Send confirmation to sender
+        socket.emit('group_message_sent', {
+            success: true,
+            message: messageToSend,
+            temp_id: temp_id
+        });
+        
+        // Broadcast to group room
+        const groupRoom = getGroupRoom(group_id);
+        io.to(groupRoom).emit('new_group_message', {
+            ...messageToSend,
+            is_mine: false
+        });
+        
+        console.log(`Group message sent: ${currentUserId} -> group ${group_id}`);
+        
+    } catch (error) {
+        console.error('Error sending group message:', error.message);
+        socket.emit('message_error', {
+            success: false,
+            error: 'Failed to send group message: ' + error.message,
+            temp_id: temp_id
+        });
+    }
+});
     
     // Handle typing indicator
     socket.on('typing', async (data) => {
@@ -1045,6 +1026,25 @@ io.on('connection', async (socket) => {
             }
         }
     });
+
+    // In server.js, add this REST API endpoint
+app.post('/api/message-deleted', verifyApiKey, (req, res) => {
+    const data = req.body;
+    console.log('Message deleted notification:', data);
+    
+    // Notify the other user
+    if (data.to_user_id && connectedUsers.has(data.to_user_id)) {
+        const userSockets = connectedUsers.get(data.to_user_id);
+        for (const socketId of userSockets.socketIds) {
+            io.to(socketId).emit('message_deleted_for_everyone', {
+                message_id: data.message_id,
+                deleted_by: data.from_user_id
+            });
+        }
+    }
+    
+    res.json({ success: true });
+});
     
     // ============================================================
     // QUIZ ROOM EVENTS
