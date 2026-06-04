@@ -25,6 +25,20 @@ const typingUsers = new Map();
 const activeQuizRooms = new Map();
 const roomTimers = new Map();
 
+// ============================================================
+// API KEY VERIFICATION MIDDLEWARE
+// ============================================================
+function verifyApiKey(req, res, next) {
+    const apiKey = req.headers['x-api-key'];
+    if (apiKey === SECRET_KEY) {
+        next();
+    } else {
+        console.log('❌ Unauthorized API request - Invalid API key:', apiKey);
+        res.writeHead(401, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Unauthorized' }));
+    }
+}
+
 // Create HTTP server
 const server = http.createServer((req, res) => {
     // Set CORS headers for all responses
@@ -147,6 +161,10 @@ const server = http.createServer((req, res) => {
             // Route: /api/post-score-update
             else if (pathname === '/api/post-score-update') {
                 handlePostScoreUpdate(data, res);
+            }
+            // FIXED: Route: /api/message-deleted
+            else if (pathname === '/api/message-deleted') {
+                handleMessageDeleted(data, res);
             }
             else {
                 console.log(`❌ Unknown endpoint: ${pathname}`);
@@ -296,6 +314,28 @@ async function handlePostScoreUpdate(data, res) {
     res.end(JSON.stringify({ success: true }));
 }
 
+// FIXED: Handle message deleted notification
+async function handleMessageDeleted(data, res) {
+    console.log('🗑️ REST API: Message deleted:', data);
+    
+    if (data.to_user_id && connectedUsers.has(data.to_user_id)) {
+        const userSockets = connectedUsers.get(data.to_user_id);
+        for (const socketId of userSockets.socketIds) {
+            io.to(socketId).emit('message_deleted_for_everyone', {
+                message_id: data.message_id,
+                deleted_by: data.from_user_id,
+                timestamp: data.timestamp
+            });
+        }
+        console.log(`✅ Sent message_deleted_for_everyone to user:${data.to_user_id} for message:${data.message_id}`);
+    } else {
+        console.log(`⚠️ User ${data.to_user_id} is offline - they will see deleted message on next load`);
+    }
+    
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ success: true }));
+}
+
 // Initialize Socket.IO with CORS settings
 const io = socketIo(server, {
     cors: {
@@ -355,7 +395,6 @@ async function initDatabase() {
         
         console.log('✅ MySQL connection pool created');
         
-        // Test the connection
         const [rows] = await dbPool.query('SELECT 1 as test, NOW() as time, DATABASE() as db_name');
         console.log(`✅ Database connected successfully to: ${rows[0].db_name}`);
         console.log(`✅ Server time: ${rows[0].time}`);
@@ -480,15 +519,12 @@ async function endQuizExam(roomId) {
     room.status = 'ended';
     room.ended_at = new Date();
     
-    // Stop timer
     const timer = roomTimers.get(roomId);
     if (timer) clearInterval(timer);
     roomTimers.delete(roomId);
     
-    // Calculate leaderboard
     const sortedParticipants = [...room.participants].sort((a, b) => b.score - a.score);
     
-    // Prepare correct answers
     const correctAnswers = room.questions.map(q => ({
         question: q.question,
         correct_answer: q.correct,
@@ -505,7 +541,6 @@ async function endQuizExam(roomId) {
         total_questions: room.questions.length
     };
     
-    // Add current user's score for each participant
     for (const participant of room.participants) {
         const userSockets = connectedUsers.get(participant.user_id);
         if (userSockets) {
@@ -519,7 +554,6 @@ async function endQuizExam(roomId) {
         }
     }
     
-    // Clean up after delay
     setTimeout(() => {
         activeQuizRooms.delete(roomId);
     }, 60000);
@@ -534,7 +568,6 @@ io.on('connection', async (socket) => {
     let currentUserId = null;
     let currentUserData = null;
     
-    // Handle user authentication
     socket.on('authenticate', async (data) => {
         const { user_id, username, full_name, avatar } = data;
         
@@ -576,7 +609,6 @@ io.on('connection', async (socket) => {
         });
     });
     
-    // Send notification to a specific user
     socket.on('send_notification', (data) => {
         const { user_id, notification } = data;
         if (!user_id || !notification) return;
@@ -588,7 +620,6 @@ io.on('connection', async (socket) => {
         }
     });
     
-    // Mark notification as read
     socket.on('mark_notification_read', (data) => {
         const { notification_id, user_id } = data;
         if (!notification_id || !user_id) return;
@@ -600,7 +631,6 @@ io.on('connection', async (socket) => {
         }
     });
     
-    // Get unread notification count
     socket.on('get_unread_notifications_count', async (data) => {
         const { user_id } = data;
         if (!user_id || !dbPool) return;
@@ -615,7 +645,6 @@ io.on('connection', async (socket) => {
         }
     });
 
-    // Post score update
     socket.on('post_score_update', (data) => {
         const { post_id, score, like_count, comment_count } = data;
         io.to(`post_${post_id}`).emit('post_score_update', {
@@ -623,7 +652,6 @@ io.on('connection', async (socket) => {
         });
     });
     
-    // Join post room
     socket.on('join_post_room', (data) => {
         const { post_id } = data;
         if (post_id) {
@@ -631,7 +659,6 @@ io.on('connection', async (socket) => {
         }
     });
 
-    // Get online users
     socket.on('get_online_users', () => {
         const onlineUsers = [];
         for (const [userId, userData] of connectedUsers) {
@@ -650,7 +677,6 @@ io.on('connection', async (socket) => {
         });
     });
     
-    // Join private chat room
     socket.on('join_private_chat', async (data) => {
         const { other_user_id } = data;
         if (!currentUserId) {
@@ -667,7 +693,6 @@ io.on('connection', async (socket) => {
         });
     });
     
-    // Join group chat room
     socket.on('join_group_chat', async (data) => {
         const { group_id } = data;
         if (!currentUserId) {
@@ -679,14 +704,13 @@ io.on('connection', async (socket) => {
         socket.emit('room_joined', { room: roomName, group_id: group_id });
     });
     
-    // Leave room
     socket.on('leave_room', (data) => {
         const { room } = data;
         if (room) socket.leave(room);
     });
     
     // ============================================================
-    // SEND PRIVATE MESSAGE - WITH BLOCK CHECK AND READ RECEIPT
+    // SEND PRIVATE MESSAGE
     // ============================================================
     socket.on('send_private_message', async (data) => {
         const { to_user_id, message, reply_to_id, temp_id } = data;
@@ -701,7 +725,6 @@ io.on('connection', async (socket) => {
             return;
         }
         
-        // CHECK IF BLOCKED (only if dbPool exists)
         if (dbPool) {
             try {
                 const [blockedRows] = await dbPool.query(
@@ -728,7 +751,6 @@ io.on('connection', async (socket) => {
         
         const recipientOnline = connectedUsers.has(to_user_id);
         
-        // Check if database is available
         if (!dbPool) {
             socket.emit('message_error', {
                 success: false,
@@ -739,7 +761,6 @@ io.on('connection', async (socket) => {
         }
         
         try {
-            // Always insert as unread (0) - only mark read when user opens chat
             const [result] = await dbPool.query(
                 `INSERT INTO messages (from_user_id, to_user_id, message, reply_to_id, is_read, created_at) 
                  VALUES (?, ?, ?, ?, 0, NOW())`,
@@ -786,7 +807,6 @@ io.on('connection', async (socket) => {
                 reactions: []
             };
             
-            // Handle image_url safely
             if (newMessage.image_url && typeof newMessage.image_url === 'string' && 
                 !newMessage.image_url.startsWith('http') && !newMessage.image_url.startsWith('/studymart') && 
                 newMessage.image_url !== 'NULL' && newMessage.image_url !== '') {
@@ -795,7 +815,6 @@ io.on('connection', async (socket) => {
                 newMessage.image_url = null;
             }
             
-            // Handle voice_url safely
             if (newMessage.voice_url && typeof newMessage.voice_url === 'string' &&
                 !newMessage.voice_url.startsWith('http') && !newMessage.voice_url.startsWith('/studymart') &&
                 newMessage.voice_url !== 'NULL' && newMessage.voice_url !== '') {
@@ -804,7 +823,6 @@ io.on('connection', async (socket) => {
                 newMessage.voice_url = null;
             }
             
-            // Get reply message if exists
             let replyToMessage = null;
             if (reply_to_id && reply_to_id > 0) {
                 try {
@@ -824,8 +842,11 @@ io.on('connection', async (socket) => {
                             image_url: quotedMsg.image_url || null,
                             voice_url: quotedMsg.voice_url || null,
                             voice_duration: quotedMsg.voice_duration || 0,
+                            from_user_id: quotedMsg.from_user_id,
                             is_mine: (quotedMsg.from_user_id == currentUserId),
                             full_name: quotedMsg.full_name || 'User',
+                            avatar: quotedMsg.avatar,
+                            username: quotedMsg.username,
                             created_at: quotedMsg.created_at
                         };
                     }
@@ -840,14 +861,12 @@ io.on('connection', async (socket) => {
                 temp_id: temp_id
             };
             
-            // Send confirmation to sender
             socket.emit('message_sent', {
                 success: true,
                 message: messageToSend,
                 temp_id: temp_id
             });
             
-            // Send to recipient if online
             if (recipientOnline) {
                 const recipientSockets = connectedUsers.get(to_user_id);
                 if (recipientSockets && recipientSockets.socketIds) {
@@ -874,97 +893,90 @@ io.on('connection', async (socket) => {
     });
     
     // Handle sending a group message
-    // In your server.js, find the send_group_message handler and fix it:
-socket.on('send_group_message', async (data) => {
-    const { group_id, message, reply_to_id, temp_id } = data;
-    
-    if (!currentUserId) {
-        socket.emit('error', { message: 'Not authenticated' });
-        return;
-    }
-    
-    if (!message || !message.trim()) {
-        socket.emit('error', { message: 'Message cannot be empty' });
-        return;
-    }
-    
-    if (!dbPool) {
-        socket.emit('message_error', {
-            success: false,
-            error: 'Database unavailable',
-            temp_id: temp_id
-        });
-        return;
-    }
-    
-    try {
-        // FIXED: Only insert columns that exist - NO reply_to_id
-        const [result] = await dbPool.query(
-            `INSERT INTO group_messages (group_id, user_id, message, created_at) 
-             VALUES (?, ?, ?, NOW())`,
-            [group_id, currentUserId, message]
-        );
+    socket.on('send_group_message', async (data) => {
+        const { group_id, message, reply_to_id, temp_id } = data;
         
-        const messageId = result.insertId;
-        
-        // Fetch the message with user data - only select existing columns
-        const [rows] = await dbPool.query(`
-            SELECT gm.id, gm.group_id, gm.user_id, gm.message, 
-                   gm.image_url, gm.voice_url, gm.voice_duration,
-                   gm.created_at,
-                   u.full_name, u.avatar, u.username, u.is_verified
-            FROM group_messages gm
-            JOIN users u ON gm.user_id = u.id
-            WHERE gm.id = ?
-        `, [messageId]);
-        
-        if (!rows || rows.length === 0) {
-            throw new Error('Failed to retrieve inserted message');
+        if (!currentUserId) {
+            socket.emit('error', { message: 'Not authenticated' });
+            return;
         }
         
-        const newMessage = rows[0];
-        newMessage.is_mine = true;
-        
-        // Fix URLs
-        if (newMessage.image_url && !newMessage.image_url.startsWith('http') && !newMessage.image_url.startsWith('/')) {
-            newMessage.image_url = '/' + newMessage.image_url;
-        }
-        if (newMessage.voice_url && !newMessage.voice_url.startsWith('http') && !newMessage.voice_url.startsWith('/')) {
-            newMessage.voice_url = '/' + newMessage.voice_url;
+        if (!message || !message.trim()) {
+            socket.emit('error', { message: 'Message cannot be empty' });
+            return;
         }
         
-        const messageToSend = {
-            ...newMessage,
-            temp_id: temp_id
-        };
+        if (!dbPool) {
+            socket.emit('message_error', {
+                success: false,
+                error: 'Database unavailable',
+                temp_id: temp_id
+            });
+            return;
+        }
         
-        // Send confirmation to sender
-        socket.emit('group_message_sent', {
-            success: true,
-            message: messageToSend,
-            temp_id: temp_id
-        });
-        
-        // Broadcast to group room
-        const groupRoom = getGroupRoom(group_id);
-        io.to(groupRoom).emit('new_group_message', {
-            ...messageToSend,
-            is_mine: false
-        });
-        
-        console.log(`Group message sent: ${currentUserId} -> group ${group_id}`);
-        
-    } catch (error) {
-        console.error('Error sending group message:', error.message);
-        socket.emit('message_error', {
-            success: false,
-            error: 'Failed to send group message: ' + error.message,
-            temp_id: temp_id
-        });
-    }
-});
+        try {
+            const [result] = await dbPool.query(
+                `INSERT INTO group_messages (group_id, user_id, message, created_at) 
+                 VALUES (?, ?, ?, NOW())`,
+                [group_id, currentUserId, message]
+            );
+            
+            const messageId = result.insertId;
+            
+            const [rows] = await dbPool.query(`
+                SELECT gm.id, gm.group_id, gm.user_id, gm.message, 
+                       gm.image_url, gm.voice_url, gm.voice_duration,
+                       gm.created_at,
+                       u.full_name, u.avatar, u.username, u.is_verified
+                FROM group_messages gm
+                JOIN users u ON gm.user_id = u.id
+                WHERE gm.id = ?
+            `, [messageId]);
+            
+            if (!rows || rows.length === 0) {
+                throw new Error('Failed to retrieve inserted message');
+            }
+            
+            const newMessage = rows[0];
+            newMessage.is_mine = true;
+            
+            if (newMessage.image_url && !newMessage.image_url.startsWith('http') && !newMessage.image_url.startsWith('/')) {
+                newMessage.image_url = '/' + newMessage.image_url;
+            }
+            if (newMessage.voice_url && !newMessage.voice_url.startsWith('http') && !newMessage.voice_url.startsWith('/')) {
+                newMessage.voice_url = '/' + newMessage.voice_url;
+            }
+            
+            const messageToSend = {
+                ...newMessage,
+                temp_id: temp_id
+            };
+            
+            socket.emit('group_message_sent', {
+                success: true,
+                message: messageToSend,
+                temp_id: temp_id
+            });
+            
+            const groupRoom = getGroupRoom(group_id);
+            io.to(groupRoom).emit('new_group_message', {
+                ...messageToSend,
+                is_mine: false
+            });
+            
+            console.log(`Group message sent: ${currentUserId} -> group ${group_id}`);
+            
+        } catch (error) {
+            console.error('Error sending group message:', error.message);
+            socket.emit('message_error', {
+                success: false,
+                error: 'Failed to send group message: ' + error.message,
+                temp_id: temp_id
+            });
+        }
+    });
     
-    // Handle typing indicator
     socket.on('typing', async (data) => {
         const { to_user_id, is_typing, group_id } = data;
         if (!currentUserId) return;
@@ -992,7 +1004,6 @@ socket.on('send_group_message', async (data) => {
         }
     });
     
-    // Handle read receipt - only when user explicitly marks as read
     socket.on('mark_read', async (data) => {
         const { from_user_id, group_id } = data;
         if (!currentUserId) return;
@@ -1026,31 +1037,11 @@ socket.on('send_group_message', async (data) => {
             }
         }
     });
-
-    // In server.js, add this REST API endpoint
-app.post('/api/message-deleted', verifyApiKey, (req, res) => {
-    const data = req.body;
-    console.log('Message deleted notification:', data);
-    
-    // Notify the other user
-    if (data.to_user_id && connectedUsers.has(data.to_user_id)) {
-        const userSockets = connectedUsers.get(data.to_user_id);
-        for (const socketId of userSockets.socketIds) {
-            io.to(socketId).emit('message_deleted_for_everyone', {
-                message_id: data.message_id,
-                deleted_by: data.from_user_id
-            });
-        }
-    }
-    
-    res.json({ success: true });
-});
     
     // ============================================================
     // QUIZ ROOM EVENTS
     // ============================================================
     
-    // Create quiz room
     socket.on('create_quiz_room', async (data) => {
         if (!currentUserId) {
             socket.emit('error', { message: 'Not authenticated' });
@@ -1097,7 +1088,6 @@ app.post('/api/message-deleted', verifyApiKey, (req, res) => {
         });
     });
 
-    // Join quiz room
     socket.on('join_quiz_room', async (data) => {
         if (!currentUserId) {
             socket.emit('error', { message: 'Not authenticated' });
@@ -1159,7 +1149,6 @@ app.post('/api/message-deleted', verifyApiKey, (req, res) => {
         });
     });
 
-    // Start quiz exam
     socket.on('start_quiz_exam', async (data) => {
         if (!currentUserId) return;
         
@@ -1183,7 +1172,6 @@ app.post('/api/message-deleted', verifyApiKey, (req, res) => {
             time_limit: room.time_limit
         });
         
-        // Start timer
         let timeLeft = room.time_limit * 60;
         const timer = setInterval(() => {
             if (timeLeft <= 0) {
@@ -1199,7 +1187,6 @@ app.post('/api/message-deleted', verifyApiKey, (req, res) => {
         roomTimers.set(room.id, timer);
     });
 
-    // Submit quiz answer
     socket.on('submit_quiz_answer', async (data) => {
         if (!currentUserId) return;
         
@@ -1218,7 +1205,6 @@ app.post('/api/message-deleted', verifyApiKey, (req, res) => {
                 full_name: currentUserData?.full_name
             });
             
-            // Check if all participants have submitted
             const allSubmitted = room.participants.every(p => p.submitted === true);
             if (allSubmitted && room.status === 'active') {
                 endQuizExam(room.id);
@@ -1226,7 +1212,6 @@ app.post('/api/message-deleted', verifyApiKey, (req, res) => {
         }
     });
     
-    // Get active rooms
     socket.on('get_active_rooms', (data) => {
         const userRooms = [];
         for (const [roomId, room] of activeQuizRooms) {
@@ -1244,7 +1229,6 @@ app.post('/api/message-deleted', verifyApiKey, (req, res) => {
         socket.emit('active_rooms_list', { rooms: userRooms });
     });
     
-    // Handle disconnection
     socket.on('disconnect', async () => {
         console.log(`🔌 Disconnected: ${socket.id}`);
         
