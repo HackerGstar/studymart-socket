@@ -187,7 +187,19 @@ const server = http.createServer((req, res) => {
 
 async function handleNewMessage(data, res) {
     console.log('📨 REST API: New message - From:', data.from_user_id, 'To:', data.to_user_id);
-    
+    // Handle group messages
+    if (data.group_id) {
+        const groupRoom = 'group_' + data.group_id;
+        io.to(groupRoom).emit('new_group_message', {
+            ...data,
+            is_mine: false
+        });
+        console.log('✅ Sent new_group_message to group:' + data.group_id);
+        
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ success: true, message: 'Group message delivered' }));
+        return;
+    }
     const { to_user_id, from_user_id } = data;
     
     if (!to_user_id || !from_user_id) {
